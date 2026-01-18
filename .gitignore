@@ -1,0 +1,5 @@
+.env
+wandb/
+data/
+__pycache__/
+*.npy
