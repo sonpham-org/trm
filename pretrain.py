@@ -52,6 +52,7 @@ class PretrainConfig(pydantic.BaseModel):
 
     # Hyperparams
     global_batch_size: int
+    micro_batch_size: Optional[int] = None  # For gradient accumulation
     epochs: int
 
     lr: float
@@ -75,9 +76,11 @@ class PretrainConfig(pydantic.BaseModel):
     # Extras
     seed: int = 0
     checkpoint_every_eval: bool = False
+    checkpoint_every_n_steps: Optional[int] = None  # Save checkpoint every N steps
     eval_interval: Optional[int] = None
     min_eval_interval: Optional[int] = 0 # when to start eval
     eval_save_outputs: List[str] = []
+    compile_model: bool = True  # Enable/disable torch.compile
 
     ema: bool = False # use Exponential-Moving-Average
     ema_rate: float = 0.999 # EMA-rate
@@ -131,12 +134,10 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
         model: nn.Module = model_cls(model_cfg)
         print(model)
         model = loss_head_cls(model, **config.arch.loss.__pydantic_extra__)  # type: ignore
-        if "DISABLE_COMPILE" not in os.environ:
+        if config.compile_model and "DISABLE_COMPILE" not in os.environ:
             model = torch.compile(model)  # type: ignore
 
-        # Load checkpoint
-        if rank == 0:
-            load_checkpoint(model, config)
+        # Checkpoint loading is now handled in init_train_state
 
         # Broadcast parameters from rank 0
         if world_size > 1:
@@ -221,7 +222,7 @@ def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetada
     # Model
     model, optimizers, optimizer_lrs = create_model(config, train_metadata, rank=rank, world_size=world_size)
 
-    return TrainState(
+    train_state = TrainState(
         step=0,
         total_steps=total_steps,
 
@@ -230,23 +231,48 @@ def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetada
         optimizer_lrs=optimizer_lrs,
         carry=None
     )
+    
+    # Load checkpoint and restore step/optimizer states if available
+    if rank == 0 and config.load_checkpoint is not None:
+        load_checkpoint(model, config, train_state)
+    
+    return train_state
 
 
 def save_train_state(config: PretrainConfig, train_state: TrainState):
-    # FIXME: Only saved model.
     if config.checkpoint_path is None:
         return
 
     os.makedirs(config.checkpoint_path, exist_ok=True)
-    torch.save(train_state.model.state_dict(), os.path.join(config.checkpoint_path, f"step_{train_state.step}"))
+    checkpoint = {
+        'step': train_state.step,
+        'model_state_dict': train_state.model.state_dict(),
+        'optimizer_states': [opt.state_dict() for opt in train_state.optimizers],
+    }
+    torch.save(checkpoint, os.path.join(config.checkpoint_path, f"step_{train_state.step}"))
 
 
-def load_checkpoint(model: nn.Module, config: PretrainConfig):
+def load_checkpoint(model: nn.Module, config: PretrainConfig, train_state: TrainState = None):
     if config.load_checkpoint is not None:
         print(f"Loading checkpoint {config.load_checkpoint}")
 
-        # Load state dict
-        state_dict = torch.load(config.load_checkpoint, map_location="cuda")
+        # Load checkpoint
+        checkpoint = torch.load(config.load_checkpoint, map_location="cuda")
+        
+        # Handle old format (just state_dict) vs new format (dict with step, model, optimizers)
+        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+            loaded_step = checkpoint.get('step', 0)
+            optimizer_states = checkpoint.get('optimizer_states', None)
+        else:
+            # Old format - just the model state dict
+            state_dict = checkpoint
+            # Try to extract step from filename
+            import re
+            match = re.search(r'step_(\d+)', config.load_checkpoint)
+            loaded_step = int(match.group(1)) if match else 0
+            optimizer_states = None
+            print(f"Old checkpoint format detected, extracted step {loaded_step} from filename")
 
         # Resize and reset puzzle emb if needed
         puzzle_emb_name = "_orig_mod.model.inner.puzzle_emb.weights"
@@ -260,6 +286,17 @@ def load_checkpoint(model: nn.Module, config: PretrainConfig):
                     torch.mean(puzzle_emb, dim=0, keepdim=True).expand(expected_shape).contiguous()
                 )
         model.load_state_dict(state_dict, assign=True)
+        
+        # Restore step and optimizer states if train_state provided
+        if train_state is not None:
+            train_state.step = loaded_step
+            print(f"Resuming from step {loaded_step}")
+            if optimizer_states is not None:
+                for opt, opt_state in zip(train_state.optimizers, optimizer_states):
+                    opt.load_state_dict(opt_state)
+                print("Restored optimizer states")
+            else:
+                print("Optimizer states not found - using fresh optimizer (learning rate will reset)")
 
 
 def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
@@ -286,10 +323,11 @@ def create_evaluators(config: PretrainConfig, eval_metadata: PuzzleDatasetMetada
 
     return evaluators
 
-def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, global_batch_size: int, rank: int, world_size: int):
-    train_state.step += 1
-    if train_state.step > train_state.total_steps:  # At most train_total_steps
-        return
+def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, global_batch_size: int, rank: int, world_size: int, is_accumulating: bool = False):
+    if not is_accumulating:
+        train_state.step += 1
+        if train_state.step > train_state.total_steps:  # At most train_total_steps
+            return
 
     # To device
     batch = {k: v.cuda() for k, v in batch.items()}
@@ -603,14 +641,41 @@ def launch(hydra_config: DictConfig):
         if RANK == 0:
             print("TRAIN")
         train_state.model.train()
+        
+        # Calculate gradient accumulation steps
+        micro_batch_size = config.micro_batch_size if config.micro_batch_size else config.global_batch_size
+        accumulation_steps = config.global_batch_size // micro_batch_size
+        
+        batch_accumulator = []
         for set_name, batch, global_batch_size in train_loader:
-            metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE)
+            # Adjust for micro-batching
+            if accumulation_steps > 1:
+                batch_accumulator.append((batch, global_batch_size))
+                
+                if len(batch_accumulator) < accumulation_steps:
+                    continue
+                
+                # Process accumulated batches
+                metrics = None
+                for i, (accum_batch, accum_global_size) in enumerate(batch_accumulator):
+                    is_last = (i == len(batch_accumulator) - 1)
+                    metrics = train_batch(config, train_state, accum_batch, global_batch_size, 
+                                        rank=RANK, world_size=WORLD_SIZE, is_accumulating=not is_last)
+                batch_accumulator = []
+            else:
+                metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE)
 
             if RANK == 0 and metrics is not None:
                 wandb.log(metrics, step=train_state.step)
                 progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
             if config.ema:
                 ema_helper.update(train_state.model)
+            
+            # Save checkpoint every N steps if configured
+            if config.checkpoint_every_n_steps is not None and train_state.step % config.checkpoint_every_n_steps == 0:
+                if RANK == 0:
+                    print(f"SAVE CHECKPOINT at step {train_state.step}")
+                    save_train_state(config, train_state)
 
         if _iter_id >= config.min_eval_interval:
             ############ Evaluation
